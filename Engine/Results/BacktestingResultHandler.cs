@@ -50,18 +50,12 @@ namespace QuantConnect.Lean.Engine.Results
         private string _errorMessage;
         private double _daysProcessed;
         private double _daysProcessedFrontier;
-        private bool _processingFinalPacket;
         private readonly HashSet<string> _chartSeriesExceededDataPoints;
 
         //Processing Time:
         private DateTime _nextSample;
         private string _algorithmId;
         private int _projectId;
-
-        /// <summary>
-        /// Boolean flag indicating the result handler thread is completely finished and ready to dispose.
-        /// </summary>
-        public bool IsActive { get; private set; }
 
         /// <summary>
         /// A dictionary containing summary statistics
@@ -73,7 +67,6 @@ namespace QuantConnect.Lean.Engine.Results
         /// </summary>
         public BacktestingResultHandler()
         {
-            IsActive = true;
             ResamplePeriod = TimeSpan.FromMinutes(4);
             NotificationPeriod = TimeSpan.FromSeconds(2);
 
@@ -95,22 +88,19 @@ namespace QuantConnect.Lean.Engine.Results
         /// <param name="messagingHandler">The handler responsible for communicating messages to listeners</param>
         /// <param name="api">The api instance used for handling logs</param>
         /// <param name="transactionHandler">The transaction handler used to get the algorithms <see cref="Order"/> information</param>
-        public virtual void Initialize(AlgorithmNodePacket job, IMessagingHandler messagingHandler, IApi api, ITransactionHandler transactionHandler)
+        public override void Initialize(AlgorithmNodePacket job, IMessagingHandler messagingHandler, IApi api, ITransactionHandler transactionHandler)
         {
             _algorithmId = job.AlgorithmId;
             _projectId = job.ProjectId;
-            MessagingHandler = messagingHandler;
-            TransactionHandler = transactionHandler;
             _job = (BacktestNodePacket)job;
             if (_job == null) throw new Exception("BacktestingResultHandler.Constructor(): Submitted Job type invalid.");
-            JobId = _job.BacktestId;
-            CompileId = _job.CompileId;
+            base.Initialize(job, messagingHandler, api, transactionHandler);
         }
 
         /// <summary>
         /// The main processing method steps through the messaging queue and processes the messages one by one.
         /// </summary>
-        public void Run()
+        protected override void Run()
         {
             try
             {
@@ -145,7 +135,6 @@ namespace QuantConnect.Lean.Engine.Results
             }
 
             Log.Trace("BacktestingResultHandler.Run(): Ending Thread...");
-            IsActive = false;
 
             // reset standard out/error
             Console.SetOut(StandardOut);
@@ -155,12 +144,12 @@ namespace QuantConnect.Lean.Engine.Results
         /// <summary>
         /// Send a backtest update to the browser taking a latest snapshot of the charting data.
         /// </summary>
-        public void Update()
+        private void Update()
         {
             try
             {
                 //Sometimes don't run the update, if not ready or we're ending.
-                if (Algorithm?.Transactions == null || _processingFinalPacket)
+                if (Algorithm?.Transactions == null || ExitTriggered)
                 {
                     return;
                 }
@@ -349,10 +338,9 @@ namespace QuantConnect.Lean.Engine.Results
         /// </summary>
         public void SendFinalResult()
         {
+            Exit();
             try
             {
-                _processingFinalPacket = true;
-
                 //Convert local dictionary:
                 var charts = new Dictionary<string, Chart>(Charts);
                 var orders = new Dictionary<int, Order>(TransactionHandler.Orders);
@@ -446,7 +434,7 @@ namespace QuantConnect.Lean.Engine.Results
         /// <param name="message">Message we'd like shown in console.</param>
         public void DebugMessage(string message)
         {
-            Messages.Enqueue(new DebugPacket(_projectId, JobId, CompileId, message));
+            Messages.Enqueue(new DebugPacket(_projectId, AlgorithmId, CompileId, message));
             AddToLogStore(message);
         }
 
@@ -456,7 +444,7 @@ namespace QuantConnect.Lean.Engine.Results
         /// <param name="message">Message we'd like shown in console.</param>
         public void SystemDebugMessage(string message)
         {
-            Messages.Enqueue(new SystemDebugPacket(_projectId, JobId, CompileId, message));
+            Messages.Enqueue(new SystemDebugPacket(_projectId, AlgorithmId, CompileId, message));
             AddToLogStore(message);
         }
 
@@ -466,7 +454,7 @@ namespace QuantConnect.Lean.Engine.Results
         /// <param name="message">Message we'd in the log.</param>
         public void LogMessage(string message)
         {
-            Messages.Enqueue(new LogPacket(JobId, message));
+            Messages.Enqueue(new LogPacket(AlgorithmId, message));
             AddToLogStore(message);
         }
 
@@ -503,7 +491,7 @@ namespace QuantConnect.Lean.Engine.Results
         {
             if (message == _errorMessage) return;
             if (Messages.Count > 500) return;
-            Messages.Enqueue(new HandledErrorPacket(JobId, message, stacktrace));
+            Messages.Enqueue(new HandledErrorPacket(AlgorithmId, message, stacktrace));
             _errorMessage = message;
         }
 
@@ -515,7 +503,7 @@ namespace QuantConnect.Lean.Engine.Results
         public void RuntimeError(string message, string stacktrace = "")
         {
             PurgeQueue();
-            Messages.Enqueue(new RuntimeErrorPacket(_job.UserId, JobId, message, stacktrace));
+            Messages.Enqueue(new RuntimeErrorPacket(_job.UserId, AlgorithmId, message, stacktrace));
             _errorMessage = message;
         }
 
@@ -642,18 +630,22 @@ namespace QuantConnect.Lean.Engine.Results
             // Only process the logs once
             if (!ExitTriggered)
             {
+                // first process synchronous events so we add any new message or log
+                ProcessSynchronousEvents(true);
+
                 List<LogEntry> copy;
                 lock (LogStore)
                 {
                     copy = LogStore.ToList();
                 }
-                ProcessSynchronousEvents(true);
                 var logLocation = SaveLogs(_algorithmId, copy);
                 SystemDebugMessage("Your log was successfully created and can be retrieved from: " + logLocation);
-            }
 
-            //Set exit flag, and wait for the messages to send:
-            ExitTriggered = true;
+                // Set exit flag, update task will send any message before stopping
+                ExitTriggered = true;
+
+                StopUpdateRunner();
+            }
         }
 
         /// <summary>
