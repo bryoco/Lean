@@ -35,6 +35,9 @@ namespace QuantConnect.Lean.Engine.Results
     /// </summary>
     public abstract class BaseResultsHandler
     {
+        private readonly ConcurrentQueue<OrderEvent> _deltaOrderEvents;
+        private int _lastOrderEventCount;
+
         /// <summary>
         /// The algorithms order events
         /// </summary>
@@ -159,6 +162,7 @@ namespace QuantConnect.Lean.Engine.Results
             ChartLock = new object();
             LogStore = new List<LogEntry>();
             OrderEvents = new ConcurrentQueue<OrderEvent>();
+            _deltaOrderEvents = new ConcurrentQueue<OrderEvent>();
         }
 
         /// <summary>
@@ -168,6 +172,47 @@ namespace QuantConnect.Lean.Engine.Results
         public virtual void OrderEvent(OrderEvent newEvent)
         {
             OrderEvents.Enqueue(newEvent);
+            _deltaOrderEvents.Enqueue(newEvent);
+        }
+
+        /// <summary>
+        /// Gets the order events generated since the last call
+        /// </summary>
+        /// <returns>The delta order events</returns>
+        protected virtual List<OrderEvent> GetDeltaOrderEvents(int maxOrderEventCount)
+        {
+            var deltaOrderEvents = OrderEvents.Skip(_lastOrderEventCount).Take(maxOrderEventCount).ToList();
+
+            if (deltaOrderEvents.Count == maxOrderEventCount)
+            {
+                // in the rare case we have generated more than 'maxOrderEventCount' order events since the last update,
+                // lets jump to the end so that we don't fall behind in the next update.
+                // Note we don't call ConcurrentQueue.Count always because its expensive
+                _lastOrderEventCount = OrderEvents.Count;
+            }
+            else
+            {
+                _lastOrderEventCount += deltaOrderEvents.Count;
+            }
+            return deltaOrderEvents;
+        }
+
+        /// <summary>
+        /// Stores the order events
+        /// </summary>
+        /// <param name="utcTime">The algorithms current utc time</param>
+        /// <param name="orderEvents">The order events to store</param>
+        protected virtual void StoreOrderEvents(DateTime utcTime, List<OrderEvent> orderEvents)
+        {
+            if (orderEvents.Count <= 0)
+            {
+                return;
+            }
+
+            var path = $"{JobId}-order-events.json";
+            var data = JsonConvert.SerializeObject(orderEvents, Formatting.None);
+
+            File.WriteAllText(path, data);
         }
 
         /// <summary>
@@ -180,7 +225,7 @@ namespace QuantConnect.Lean.Engine.Results
 
             OrderEvent orderEvent;
             while (!shouldStop(deltaOrders.Count)
-                   && OrderEvents.TryDequeue(out orderEvent)
+                   && _deltaOrderEvents.TryDequeue(out orderEvent)
                    // we can have more than 1 order event per order id
                    && !deltaOrders.ContainsKey(orderEvent.OrderId))
             {
